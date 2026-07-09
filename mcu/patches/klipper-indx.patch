@@ -1,0 +1,290 @@
+diff -ruN a/Makefile b/Makefile
+--- a/Makefile	2026-07-09 08:22:41.033932327 +0200
++++ b/Makefile	2026-07-09 08:25:32.569637208 +0200
+@@ -30,12 +30,15 @@
+     ; then echo "$(2)"; else echo "$(3)"; fi ;)
+ 
+ CFLAGS := -iquote $(OUT) -iquote src -iquote $(OUT)board-generic/ \
+-		-std=gnu11 -O2 -MD -Wall \
+-		-Wold-style-definition $(call cc-option,$(CC),-Wtype-limits,) \
++		-O2 -MD -Wall $(call cc-option,$(CC),-Wtype-limits,) \
+     -ffunction-sections -fdata-sections -fno-delete-null-pointer-checks
+ CFLAGS += -flto=auto -fwhole-program -fno-use-linker-plugin -ggdb3
++CONLYFLAGS := -std=gnu11 -Wold-style-definition
++CXXFLAGS := -std=c++20 -fno-rtti -fno-exceptions
+ 
+-OBJS_klipper.elf = $(patsubst %.c, $(OUT)src/%.o,$(src-y))
++OBJS_klipper.elf = \
++    $(filter %.o,$(patsubst %.c, $(OUT)src/%.o,$(src-y))) \
++    $(filter %.o,$(patsubst %.c++, $(OUT)src/%.o,$(src-y)))
+ OBJS_klipper.elf += $(OUT)compile_time_request.o
+ CFLAGS_klipper.elf = $(CFLAGS) -Wl,--gc-sections
+ 
+@@ -56,13 +59,20 @@
+ 
+ # Include board specific makefile
+ include src/Makefile
++ifeq ($(CONFIG_WANT_INDX_HEATER),y)
++include src/indx/Makefile
++endif
+ -include src/$(patsubst "%",%,$(CONFIG_BOARD_DIRECTORY))/Makefile
+ 
+ ################ Main build rules
+ 
+ $(OUT)%.o: %.c $(OUT)autoconf.h
+ 	@echo "  Compiling $@"
+-	$(Q)$(CC) $(CFLAGS) -c $< -o $@
++	$(Q)$(CC) $(CFLAGS) $(CONLYFLAGS) -c $< -o $@
++
++$(OUT)%.o: %.c++ $(OUT)autoconf.h
++	@echo "  Compiling $@"
++	$(Q)$(CC) $(CFLAGS) $(CXXFLAGS) -c $< -o $@
+ 
+ $(OUT)%.ld: %.lds.S $(OUT)autoconf.h
+ 	@echo "  Preprocessing $@"
+@@ -78,9 +88,13 @@
+ $(OUT)%.o.ctr: $(OUT)%.o
+ 	$(Q)$(OBJCOPY) -j '.compile_time_request' -O binary $^ $@
+ 
+-$(OUT)compile_time_request.o: $(patsubst %.c, $(OUT)src/%.o.ctr,$(src-y)) ./scripts/buildcommands.py
++ctrs-y = \
++    $(filter %.o.ctr,$(patsubst %.c, $(OUT)src/%.o.ctr,$(src-y))) \
++    $(filter %.o.ctr,$(patsubst %.c++, $(OUT)src/%.o.ctr,$(src-y)))
++
++$(OUT)compile_time_request.o: $(ctrs-y) ./scripts/buildcommands.py
+ 	@echo "  Building $@"
+-	$(Q)cat $(patsubst %.c, $(OUT)src/%.o.ctr,$(src-y)) | tr -s '\0' '\n' > $(OUT)compile_time_request.txt
++	$(Q)cat $(ctrs-y) | tr -s '\0' '\n' > $(OUT)compile_time_request.txt
+ 	$(Q)$(PYTHON) ./scripts/buildcommands.py -d $(OUT)klipper.dict -t "$(CC);$(AS);$(LD);$(OBJCOPY);$(OBJDUMP);$(STRIP)" $(OUT)compile_time_request.txt $(OUT)compile_time_request.c
+ 	$(Q)$(CC) $(CFLAGS) -c $(OUT)compile_time_request.c -o $@
+ 
+diff -ruN a/scripts/flash_usb.py b/scripts/flash_usb.py
+--- a/scripts/flash_usb.py	2026-07-09 08:22:41.034018669 +0200
++++ b/scripts/flash_usb.py	2026-07-09 08:24:12.224296492 +0200
+@@ -4,7 +4,7 @@
+ # Copyright (C) 2019  Kevin O'Connor <kevin@koconnor.net>
+ #
+ # This file may be distributed under the terms of the GNU GPLv3 license.
+-import sys, os, re, subprocess, optparse, time, fcntl, termios, struct
++import sys, os, re, subprocess, optparse, time, fcntl, termios, struct, zlib
+ 
+ class error(Exception):
+     pass
+@@ -164,6 +164,28 @@
+     if res != 0:
+         raise error("Error running hid-flash")
+ 
++
++def fix_indx_crc(binfile, start):
++    if start is None:
++        raise error("INDX flashing requires a start address")
++    with open(binfile, "r+b") as f:
++        data = bytearray(f.read())
++        if len(data) < 0x20:
++            raise error("INDX firmware image is too small")
++        crcpos = struct.unpack("<I", data[0x1C:0x20])[0] - start
++        if crcpos == len(data) - 4:
++            crc = zlib.crc32(data[:crcpos]) & 0xFFFFFFFF
++            if struct.unpack("<I", data[crcpos : crcpos + 4])[0] == crc:
++                return
++            f.seek(crcpos)
++            f.write(struct.pack("<I", crc))
++            return
++        if crcpos != len(data):
++            data[0x1C:0x20] = struct.pack("<I", start + len(data))
++        f.seek(0)
++        f.write(data)
++        f.write(struct.pack("<I", zlib.crc32(data) & 0xFFFFFFFF))
++
+ # Flash via call to hid-flash
+ def flash_hidflash(device, binfile, sudo=True):
+     hexfmt_r = re.compile(r"^[a-fA-F0-9]{4}:[a-fA-F0-9]{4}$")
+@@ -342,9 +364,18 @@
+         sys.stderr.write(RP2040_HELP % (options.device, str(e), rawdev))
+         sys.exit(-1)
+ 
++
++def flash_indx(options, binfile):
++    try:
++        fix_indx_crc(binfile, options.start)
++        flash_dfuutil(options.device, binfile, [], options.sudo)
++    except error as e:
++        sys.stderr.write("Failed to flash to %s: %s\n" % (options.device, str(e)))
++        sys.exit(-1)
++
+ MCUTYPES = {
+     'sam3': flash_atsam3, 'sam4': flash_atsam4, 'same70': flash_atsam4,
+-    'samd': flash_atsamd, 'same5': flash_atsamd,
++    'samd': flash_atsamd, 'same5': flash_atsamd, 'indx': flash_indx,
+     'lpc176': flash_lpc176x, 'stm32f103': flash_stm32f1,
+     'stm32f4': flash_stm32f4, 'stm32f042': flash_stm32f4,
+     'stm32f070': flash_stm32f4, 'stm32f072': flash_stm32f4,
+diff -ruN a/src/Kconfig b/src/Kconfig
+--- a/src/Kconfig	2026-07-09 08:22:41.033943847 +0200
++++ b/src/Kconfig	2026-07-09 08:23:27.133655900 +0200
+@@ -74,6 +74,10 @@
+     default y
+ config USB_SERIAL_NUMBER
+     default "12345"
++config USB_MANUFACTURER
++    default "Klipper"
++config USB_PRODUCT
++    default "MCU"
+ 
+ menu "USB ids"
+     depends on USB && LOW_LEVEL_OPTIONS
+@@ -85,6 +89,10 @@
+     bool "USB serial number from CHIPID" if HAVE_CHIPID
+ config USB_SERIAL_NUMBER
+     string "USB serial number" if !USB_SERIAL_NUMBER_CHIPID
++config USB_MANUFACTURER
++    string "USB manufacturer"
++config USB_PRODUCT
++    string "USB product"
+ endmenu
+ 
+ # Optional features that can be disabled (for devices with small flash sizes)
+@@ -128,6 +136,9 @@
+     bool
+     depends on HAVE_GPIO
+     default y
++config WANT_INDX_HEATER
++    bool "Bondtech INDX Heater"
++    depends on MACH_SAME51J19 && CLOCK_REF_X25M_XOSC0 && SAMD51_FREQ_120
+ config WANT_ST7920
+     bool
+     depends on HAVE_GPIO
+diff -ruN a/src/atsamd/Kconfig b/src/atsamd/Kconfig
+--- a/src/atsamd/Kconfig	2026-07-09 08:22:41.033960608 +0200
++++ b/src/atsamd/Kconfig	2026-07-09 08:23:27.134473560 +0200
+@@ -169,6 +169,8 @@
+         bool "12Mhz crystal" if MACH_SAMC21
+     config CLOCK_REF_X25M
+         bool "25Mhz crystal" if MACH_SAMC21 || MACH_SAMX5
++    config CLOCK_REF_X25M_XOSC0
++        bool "25Mhz crystal on XOSC0" if MACH_SAMX5
+     config CLOCK_REF_INTERNAL
+         bool "Internal clock" if !MACH_SAMC21
+ endchoice
+diff -ruN a/src/atsamd/Makefile b/src/atsamd/Makefile
+--- a/src/atsamd/Makefile	2026-07-09 08:22:41.033968388 +0200
++++ b/src/atsamd/Makefile	2026-07-09 08:23:27.135631039 +0200
+@@ -58,7 +58,11 @@
+ 
+ BOSSAC_OFFSET-$(CONFIG_MACH_SAMD21) := 0x2000
+ BOSSAC_OFFSET-$(CONFIG_MACH_SAMX5) := 0x4000
++FLASH_TYPE-y := $(CONFIG_MCU)
++FLASH_TYPE-$(CONFIG_WANT_INDX_HEATER) := indx
++FLASH_DEPS-y := lib/bossac/bin/bossac
++FLASH_DEPS-$(CONFIG_WANT_INDX_HEATER) :=
+ 
+-flash: $(OUT)klipper.bin lib/bossac/bin/bossac
++flash: $(OUT)klipper.bin $(FLASH_DEPS-y)
+ 	@echo "  Flashing $< to $(FLASH_DEVICE)"
+-	$(Q)$(PYTHON) ./scripts/flash_usb.py -t $(CONFIG_MCU) -d "$(FLASH_DEVICE)" -s "$(BOSSAC_OFFSET-y)" $(OUT)klipper.bin
++	$(Q)$(PYTHON) ./scripts/flash_usb.py -t $(FLASH_TYPE-y) -d "$(FLASH_DEVICE)" -s "$(BOSSAC_OFFSET-y)" $(OUT)klipper.bin
+diff -ruN a/src/atsamd/adc.c b/src/atsamd/adc.c
+--- a/src/atsamd/adc.c	2026-07-09 08:22:41.033976258 +0200
++++ b/src/atsamd/adc.c	2026-07-09 08:23:27.136425598 +0200
+@@ -53,11 +53,13 @@
+     GPIO('A', 5), GPIO('A', 6), GPIO('A', 7), GPIO('A', 8), GPIO('A', 9),
+     GPIO('A', 10), GPIO('A', 11), GPIO('B', 0), GPIO('B', 1), GPIO('B', 2),
+     GPIO('B', 3),
++#if !CONFIG_WANT_INDX_HEATER
+     /* ADC1 */
+     GPIO('B', 8), GPIO('B', 9), GPIO('A', 8), GPIO('A', 9), GPIO('C', 2),
+     GPIO('C', 3), GPIO('B', 4), GPIO('B', 5), GPIO('B', 6), GPIO('B', 7),
+     GPIO('C', 0), GPIO('C', 1), GPIO('C', 30), GPIO('C', 31), GPIO('D', 0),
+     GPIO('D', 1)
++#endif
+ };
+ #endif
+ 
+diff -ruN a/src/atsamd/samd51_clock.c b/src/atsamd/samd51_clock.c
+--- a/src/atsamd/samd51_clock.c	2026-07-09 08:22:41.033984308 +0200
++++ b/src/atsamd/samd51_clock.c	2026-07-09 08:23:50.323862887 +0200
+@@ -99,6 +99,8 @@
+ 
+ #if CONFIG_CLOCK_REF_X32K
+ DECL_CONSTANT_STR("RESERVE_PINS_crystal", "PA0,PA1");
++#elif CONFIG_CLOCK_REF_X25M_XOSC0
++DECL_CONSTANT_STR("RESERVE_PINS_crystal", "PA14,PA15");
+ #elif CONFIG_CLOCK_REF_X25M
+ DECL_CONSTANT_STR("RESERVE_PINS_crystal", "PB22,PB23");
+ #endif
+@@ -131,26 +133,33 @@
+ static void
+ clock_init_25m(void)
+ {
+-    // Enable XOSC1
++#if CONFIG_CLOCK_REF_X25M_XOSC0
++    uint32_t xosc = 0, xoscrdy = OSCCTRL_STATUS_XOSCRDY0;
++    uint32_t refclk = OSCCTRL_DPLLCTRLB_REFCLK_XOSC0;
++#else
++    uint32_t xosc = 1, xoscrdy = OSCCTRL_STATUS_XOSCRDY1;
++    uint32_t refclk = OSCCTRL_DPLLCTRLB_REFCLK_XOSC1;
++#endif
++    // Enable XOSC
+     uint32_t freq_xosc = 25000000;
+     uint32_t val = (OSCCTRL_XOSCCTRL_ENABLE | OSCCTRL_XOSCCTRL_XTALEN
+                     | OSCCTRL_XOSCCTRL_IPTAT(3) | OSCCTRL_XOSCCTRL_IMULT(6));
+-    OSCCTRL->XOSCCTRL[1].reg = val;
+-    while (!(OSCCTRL->STATUS.reg & OSCCTRL_STATUS_XOSCRDY1))
++    OSCCTRL->XOSCCTRL[xosc].reg = val;
++    while (!(OSCCTRL->STATUS.reg & xoscrdy))
+         ;
+ 
+-    // Generate 120Mhz clock on PLL0 (with XOSC1 as reference)
++    // Generate 120Mhz clock on PLL0 (with XOSC as reference)
+     uint32_t p0div = 10, p0mul = DIV_ROUND_CLOSEST(FREQ_MAIN, freq_xosc/p0div);
+     uint32_t p0ctrlb = OSCCTRL_DPLLCTRLB_DIV(p0div / 2 - 1);
+-    config_dpll(0, p0mul, p0ctrlb | OSCCTRL_DPLLCTRLB_REFCLK_XOSC1);
++    config_dpll(0, p0mul, p0ctrlb | refclk);
+ 
+     // Switch main clock to 120Mhz PLL0
+     gen_clock(CLKGEN_MAIN, GCLK_GENCTRL_SRC_DPLL0);
+ 
+-    // Generate 48Mhz clock on PLL1 (with XOSC1 as reference)
++    // Generate 48Mhz clock on PLL1 (with XOSC as reference)
+     uint32_t p1div = 50, p1mul = DIV_ROUND_CLOSEST(FREQ_48M, freq_xosc/p1div);
+     uint32_t p1ctrlb = OSCCTRL_DPLLCTRLB_DIV(p1div / 2 - 1);
+-    config_dpll(1, p1mul, p1ctrlb | OSCCTRL_DPLLCTRLB_REFCLK_XOSC1);
++    config_dpll(1, p1mul, p1ctrlb | refclk);
+     gen_clock(CLKGEN_48M, GCLK_GENCTRL_SRC_DPLL1);
+ }
+ 
+@@ -198,7 +207,7 @@
+     // Init clocks
+     if (CONFIG_CLOCK_REF_X32K)
+         clock_init_32k();
+-    else if (CONFIG_CLOCK_REF_X25M)
++    else if (CONFIG_CLOCK_REF_X25M || CONFIG_CLOCK_REF_X25M_XOSC0)
+         clock_init_25m();
+     else
+         clock_init_internal();
+diff -ruN a/src/generic/usb_canbus.c b/src/generic/usb_canbus.c
+--- a/src/generic/usb_canbus.c	2026-07-09 08:22:41.033991579 +0200
++++ b/src/generic/usb_canbus.c	2026-07-09 08:23:50.324912654 +0200
+@@ -403,6 +403,6 @@
+ #define CONCAT1(a, b) a ## b
+ #define CONCAT(a, b) CONCAT1(a, b)
+-#define USB_STR_MANUFACTURER u"Klipper"
+-#define USB_STR_PRODUCT CONCAT(u,CONFIG_MCU)
++#define USB_STR_MANUFACTURER CONCAT(u,CONFIG_USB_MANUFACTURER)
++#define USB_STR_PRODUCT CONCAT(u,CONFIG_USB_PRODUCT)
+ #define USB_STR_SERIAL CONCAT(u,CONFIG_USB_SERIAL_NUMBER)
+ 
+ // String descriptors
+diff -ruN a/src/generic/usb_cdc.c b/src/generic/usb_cdc.c
+--- a/src/generic/usb_cdc.c	2026-07-09 08:22:41.034006369 +0200
++++ b/src/generic/usb_cdc.c	2026-07-09 08:23:50.324869593 +0200
+@@ -139,6 +139,6 @@
+ #define CONCAT1(a, b) a ## b
+ #define CONCAT(a, b) CONCAT1(a, b)
+-#define USB_STR_MANUFACTURER u"Klipper"
+-#define USB_STR_PRODUCT CONCAT(u,CONFIG_MCU)
++#define USB_STR_MANUFACTURER CONCAT(u,CONFIG_USB_MANUFACTURER)
++#define USB_STR_PRODUCT CONCAT(u,CONFIG_USB_PRODUCT)
+ #define USB_STR_SERIAL CONCAT(u,CONFIG_USB_SERIAL_NUMBER)
+ 
+ // String descriptors
