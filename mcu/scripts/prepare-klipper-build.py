@@ -9,7 +9,6 @@ import sys
 import tempfile
 import time
 
-
 EXCLUDED_DIRS = set([".git", ".jj", "out", "__pycache__"])
 
 

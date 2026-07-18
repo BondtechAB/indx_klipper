@@ -84,3 +84,19 @@ def register_adc_callback(adc, callback):
         # Old klipper and Kalico ADC callback style
         adc.setup_adc_callback(0.3, callback)
         adc.setup_minmax(0.001, 8)
+
+
+def get_tmc_current_helper(stepper):
+    """
+    Return the current helper for a stepper.
+    Compatibility layer for Kalico and Klipper.
+    """
+    printer = stepper.get_mcu().get_printer()
+    driver_name = "tmc2240 " + stepper.get_name()
+    driver = printer.lookup_object(driver_name, None)
+    if driver is None:
+        raise printer.command_error(
+            "TMC driver object '%s' could not be found" % (driver_name,)
+        )
+    command_helper = driver.get_phase_offset.__self__
+    return command_helper.current_helper
